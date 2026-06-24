@@ -1,7 +1,8 @@
 # ADR 0001: Agentic Platform CRD Architecture
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-06-01
+**Updated:** 2026-06-22
 **Authors:** David Zager, Dylan Murray
 
 ## Context
@@ -26,6 +27,10 @@ task lifecycle. The goals are:
    without requiring it as the workload launcher.
 5. Support multiple agent runtimes (goose, opencode, and future
    options) without baking runtime-specific concepts into the CRDs.
+6. Keep CRDs domain-agnostic — the primitives work for migration,
+   code review, infrastructure automation, or any future agentic
+   workload. The controller has no dependency on Hub or any
+   inventory system.
 
 ## Decision
 
@@ -33,26 +38,24 @@ task lifecycle. The goals are:
 
 We introduce seven Custom Resource Definitions. The first two adopt
 skillimage's existing YAML format as their CRD spec, aligning our
-Kubernetes API with the emerging OCI skills ecosystem. The last two
-are execution resources inspired by Tekton's Pipeline/PipelineRun
-split:
+Kubernetes API with the emerging OCI skills ecosystem.
 
 **Definition resources** (templates, inert until executed):
 
 | CRD | Purpose |
 |-----|---------|
-| **SkillCard** | Individual skill or rule. Adopts skillimage.io/v1alpha1 SkillCard format. A `type: rule` field distinguishes always-loaded constraints from on-demand skills. References an OCI artifact. |
-| **SkillCollection** | Group of skills from OCI image refs or git sources. Adopts skillimage.io/v1alpha1 SkillCollection format. |
+| **SkillCard** | Individual skill or rule. Adopts skillimage.io/v1alpha1 SkillCard format. A `type: rule` field distinguishes always-loaded constraints from on-demand skills. Supports three source types: OCI image ref, git source, or inline markdown — all resolve to an OCI artifact. |
+| **SkillCollection** | Group of skills. Each entry references a skill by OCI image ref, git source, or SkillCard CR name. |
 | **LLMProvider** | LLM service endpoint, credentials (Secret ref), and available models with context window sizes and optional tier labels. |
-| **Agent** | Binds SkillCards + SkillCollections + LLMProvider + container image + prompt + optional memory service. References skills both individually and via collections. |
-| **AgentPlan** | High-level guide with ordered stages. Each stage groups phases that share session continuity. Each phase references an Agent and carries markdown instructions. |
+| **Agent** | Template declaring what is available for execution. References one or more LLMProviders, SkillCards, SkillCollections, a container image, a prompt, and declares typed parameters (inputs the AgentRun must supply). Does not select a specific model — model selection happens at execution time. Analogous to a Tekton Task. |
+| **AgentPlaybook** | Ordered sequence of stages. Each stage references an Agent and carries instructions. Stages execute sequentially with fresh agent sessions. Cross-stage continuity is through git branch content. |
 
 **Execution resources** (created to trigger work):
 
 | CRD | Purpose |
 |-----|---------|
-| **AgentRun** | Executes a single Agent against an application. References an Agent (or inlines the spec), carries instructions and application-specific parameters. Controller creates a Sandbox and tracks status. |
-| **AgentPlanRun** | Executes an AgentPlan. References an AgentPlan (or inlines the spec) with application-specific parameters. Controller orchestrates phase-by-phase execution, manages PVCs, passes session IDs, and tracks per-phase status. |
+| **AgentRun** | Execute a single Agent with specific values. References an Agent, selects models, supplies parameter values, carries instructions, and may include additional `env` and `envFrom` entries passed through to the Sandbox. The controller validates params against the Agent's declarations, creates a Sandbox, and tracks status. Analogous to a Tekton TaskRun. |
+| **AgentPlaybookRun** | Execute an AgentPlaybook. Creates AgentRun CRs sequentially per stage, all sharing the same target branch. Each stage reads the previous stage's committed handoff files. |
 
 ### Naming alignment with skillimage
 
@@ -83,93 +86,153 @@ us:
 - Lifecycle management (draft → testing → published → deprecated →
   archived).
 
-Pallet's agent-native placement logic and governance model are
-contributed upstream to skillimage rather than maintained as a separate
-tool.
+### Skill mounting: one directory
 
-### CRDs as the backend — no Hub API for these resources
+All skills live at `/opt/skills/{skillName}/SKILL.md`. Built-in
+skills are baked into the base image at build time. ImageVolume-
+mounted skills are mounted into subdirectories alongside them:
 
-The UI talks directly to the Kubernetes API server for CRD CRUD
-operations. The tackle2-ui Node.js server already acts as a reverse
-proxy (forwarding `/hub` to the Hub API); we add a `/k8s` proxy route
-that forwards to `kubernetes.default.svc` using the pod's service
-account token. This eliminates the need for Hub backend changes (no
-new Go models, no database migrations, no API handlers).
+```
+/opt/skills/
+  konveyor-migration/SKILL.md   ← baked into image
+  javax-rules/SKILL.md          ← ImageVolume from SkillCard
+  custom-rules/SKILL.md         ← ImageVolume from SkillCard
+```
+
+`skillctl build` puts `SKILL.md` at the root of the OCI image.
+Mount at `/opt/skills/{name}` → it lands at the right path. No
+symlinks, no fan-out, no entrypoint discovery logic needed.
+
+The agent runtime points at `/opt/skills/` and discovers all
+skills regardless of source.
+
+### UI access to CRDs via Hub passthrough
+
+All seven resources are Kubernetes CRDs. The UI accesses them through
+Hub's existing service passthrough pattern (`ServiceHandler.Forward`),
+which proxies requests to the Kubernetes API server using Hub's
+service account token. Hub provides RBAC scope checking on the way
+in. This avoids adding a separate `/k8s` proxy route to the UI
+server and keeps all UI traffic flowing through Hub.
+
+The passthrough approach is adopted for the POC. The long-term API
+surface (whether Hub should expose a more curated API for agent
+resources, or continue with the passthrough) is left for future
+investigation. Exposing raw Kubernetes API responses through Hub
+has trade-offs (k8s API conventions differ from Hub's REST
+conventions, privilege escalation risk via Hub's SA, joining agent
+data with Hub application data requires cross-plane queries) that
+need further evaluation.
+
+### Agent as template, AgentRun as invocation
+
+The Agent declares what the execution needs. The AgentRun supplies
+concrete values. The controller validates and passes them through.
+
+**Agent declares:**
+- `params` — typed parameters (name, type, description, default)
+- `providers` — available LLM providers and models
+- `skillCards`, `skillCollections` — available skills
+- `image` — container image with runtime and toolchains
+- `prompt` — standing instructions
+
+**AgentRun supplies:**
+- `params` — values for each declared parameter
+- `models` — specific provider/model selections
+- `instructions` — what to do in this run
+- `env`, `envFrom` — additional env vars and secret refs passed
+  through to the Sandbox as raw Kubernetes primitives
+
+The controller does not interpret parameter values. It injects them
+as environment variables (`KONVEYOR_PARAM_{NAME}`) into the Sandbox.
+Git URLs, Hub tokens, MCP server addresses — these are all just
+parameter values to the controller. The harness and agent inside
+the Sandbox know what to do with them.
+
+This follows the Tekton Task/TaskRun pattern: the Task declares
+inputs, the TaskRun supplies values, the controller creates a Pod.
 
 ### Execution via Agent Sandbox
 
 Agent workloads run as Agent Sandbox resources
 (kubernetes-sigs/agent-sandbox). Agent Sandbox is single-container by
-design — each Sandbox is one pod with one container image. Each phase
-in an AgentPlan runs as its own Sandbox:
+design — each Sandbox is one pod with one container image.
 
-- **Phase → Sandbox:** Each phase generates a Sandbox with
-  ImageVolumes for its Agent's skills/rules, Secret env vars for LLM
-  credentials, and the Agent's container image.
-- **Session PVC:** All phases within a stage mount a shared PVC
-  containing the agent runtime's session state (SQLite database).
-  Each phase resumes the session from the previous phase, providing
-  full conversation continuity within the stage.
-- **Workspace PVC:** All phases across all stages mount a shared
-  workspace PVC containing the application repository. Cross-stage
-  handoff files (e.g. PLAN.md tracking progress) are written here.
-- **SandboxWarmPool:** Pre-allocated agent pods for running migrations
-  at fleet scale.
+- **AgentRun → Sandbox:** Each AgentRun creates a Sandbox with
+  ImageVolumes for skills (mounted at `/opt/skills/{name}/`),
+  LLM credential Secrets, params as env vars, user-specified `env`
+  and `envFrom` passed through, and the Agent's container image.
+- **EmptyDir workspace:** The workspace is ephemeral. The harness
+  clones the git repo, the agent works, the harness commits and
+  pushes. When the pod dies, the EmptyDir is gone. All durable
+  state is in git.
+- **SandboxWarmPool:** Pre-allocated agent pods for running
+  workloads at fleet scale.
 
-### AgentPlan execution model
+### Git-as-persistence
 
-Each phase is an independently-executed Sandbox that references its
-own Agent. Phases within a stage can use different Agents (different
-skills, different prompts) while maintaining session continuity — the
-constraint is that all Agents within a stage must share the same
-runtime (e.g. all goose or all opencode) so session resumption works.
+Workspaces are ephemeral. Git is the persistence layer.
 
-An AgentPlan's guide is written to the shared workspace as a context
-file before any phase starts. Each phase's instructions are joined
-with its Agent's prompt at execution time:
+The harness (entrypoint in the base image) manages the full git
+lifecycle:
 
-1. Plan Guide → workspace context file (ambient awareness)
-2. Agent Prompt → standing instructions (how the agent operates)
-3. Phase Instructions → specific task (what to do now)
+1. Clone the source repo into `/workspace/repo`
+2. Create or checkout the target branch
+3. Agent works, harness commits incrementally
+4. On exit: commit `.konveyor/handoff.md` and
+   `.konveyor/session.json` to the branch
+5. Push to the target repo (assets repo or source repo fallback)
+6. Write `/.konveyor/results.json` (pod-local, read by controller)
 
-**Within a stage:** Phases execute sequentially. Each phase runs in
-its own Sandbox but resumes the agent session from the previous phase
-via the session PVC. The agent retains full conversation history —
-it remembers what it did in prior phases. Different phases can bring
-different skills, enabling tool reconfiguration between steps.
+No PVCs survive between runs. Cross-stage continuity in playbooks
+is through committed files on the shared branch. Parallel agents
+on the same application use different branches.
 
-**Across stages:** A new stage starts with fresh agent context (no
-session continuity). Cross-stage knowledge transfer happens through
-two mechanisms:
+### Two repos per application
 
-1. **Handoff files** on the workspace PVC — each stage updates
-   structured documents (e.g. PLAN.md, CONTEXT.md) recording what
-   was accomplished and what remains. The next stage's agent reads
-   these as part of its initial context.
-2. **Per-agent memory service** — each Agent optionally has a
-   persistent, queryable knowledge base (accessible via MCP) that
-   accumulates domain knowledge across executions. When the same
-   Agent appears in a later stage, it queries its memory for
-   relevant patterns and decisions.
+The controller resolves git coordinates from the application
+inventory (Hub, Backstage, or direct git config):
 
-### Session resumption via PVC
+- **Source repo** — clone from (read-only credentials sufficient)
+- **Assets repo** — push results to (write credentials required)
 
-Both supported agent runtimes store session state in SQLite databases
-whose location can be controlled via environment variables:
+If no assets repo is configured, the harness pushes to the source
+repo on a `konveyor/<run-name>` branch. This follows the pattern
+established by the assets-generation enhancement and implemented
+in tackle2-addon-platform.
 
-- **Goose:** `GOOSE_PATH_ROOT` redirects all state (including
-  `sessions.db`) to a configurable root. Resume via
-  `goose run --resume --session-id <ID>`.
-- **Opencode:** `OPENCODE_DB` controls the database path. Resume via
-  `opencode run --session <ID>`.
+### AgentPlaybook execution model
 
-The orchestrator sets these environment variables to point at the
-session PVC mount. After each phase completes, the session ID is
-captured. The next phase's Sandbox mounts the same PVC and resumes
-the session. Sequential access is guaranteed by phase ordering —
-SQLite does not support concurrent writers.
+An AgentPlaybook is a flat sequence of stages. Each stage references
+an Agent and carries instructions. The AgentPlaybookRun controller
+creates AgentRuns sequentially, all targeting the same branch.
 
-### Per-agent memory service
+Each stage gets a fresh agent session. Cross-stage knowledge
+transfer happens through committed files on the branch:
+
+1. **Handoff files** — each stage commits `.konveyor/handoff.md`
+   summarizing what was accomplished and what remains. The next
+   stage's agent reads this on checkout.
+2. **Playbook guide** — the playbook's guide is committed as
+   `.konveyor/guide.md` before stage 1, providing ambient context.
+
+Prompt composition at execution time:
+
+1. Agent Prompt → standing instructions (how the agent operates)
+2. Stage Instructions → specific task (what to do now)
+3. `.konveyor/handoff.md` → context from previous stages (read by
+   the agent as a file in the working tree)
+
+### Future: Phases within stages
+
+The current model uses flat stages with fresh sessions. A future
+enhancement may introduce phases within stages for session
+continuity — multiple phases sharing a single agent session via
+PVC-backed session state (SQLite database). This would enable
+tool reconfiguration between steps without losing conversation
+history. This is deferred until the flat-stage model is proven.
+
+### Per-agent memory service (Phase 4)
 
 An Agent may reference a memory service — a persistent MCP server
 that stores structured domain knowledge (patterns, pitfalls, API
@@ -177,21 +240,29 @@ mappings, diary entries). The agent reads from memory at session start
 and writes discoveries at session end. Memory accumulates across all
 executions of that Agent, enabling organizational learning.
 
-The POC uses mempalace (deployed as a sidecar service with its own
-PVC) exposed to goose via `--with-streamable-http-extension`. The
-memory service is owned by the Agent, not the plan — the same Agent
-in different plans shares the same accumulated knowledge.
+A POC exists in dymurray/tackle2-addon-kai using mempalace. Memory
+service integration is deferred to Phase 4 — after the core execution
+model (AgentRun), playbooks (AgentPlaybook), and configurable git
+strategy are proven.
 
 ### Hub as a data service
 
-Hub is not the workload launcher. The agent container calls Hub's API
-at runtime for:
+Hub is not the workload launcher. The controller does not call Hub.
 
-- Analysis results (`GET /hub/applications/{id}/analysis/issues`)
-- Application metadata and git credentials
+**At AgentRun creation time** — the creator of the AgentRun (UI,
+Backstage plugin, CLI, CI pipeline) resolves application metadata
+from whatever inventory it uses and supplies git URLs, credentials,
+and any other context as params and env/envFrom on the AgentRun.
+The controller passes these through without interpretation.
 
-These are passed as environment variables (`HUB_BASE_URL`, `HUB_TOKEN`,
-`APP_ID`) set on the Sandbox by the UI or controller.
+**At agent runtime** — the agent inside the Sandbox may call Hub's
+API for analysis results, application facts, etc. The creator of
+the AgentRun provides Hub coordinates and credentials via params
+and envFrom. The controller does not know about Hub.
+
+This means the CRDs are fully decoupled from any inventory system.
+Hub, Backstage, or a plain git URL — the controller treats them
+all the same.
 
 ### Subagent delegation is a runtime concern
 
@@ -219,80 +290,51 @@ skills to declare system-level tool dependencies.
 
 #### Layered image architecture
 
-Three layers, inspired by the Ansible Playbook Bundle (APB) pattern:
+Three layers:
 
 **Layer 1 — Base image** (`quay.io/konveyor/agent-base`):
 
-- UBI 10
-- Agent runtimes (goose, opencode)
-- Konveyor tools (`fetch-analysis`, `run-analysis`)
+- UBI 9
+- Harness entrypoint (Go binary)
+- Konveyor tools (`fetch-analysis`, `run-analysis`, `skillctl`)
 - Core skills baked into `/opt/skills/`
-- git, ssh, basics
-- Entrypoint that discovers skills (from ImageVolumes and `/opt/skills/`),
-  configures the agent runtime, injects credentials, and starts the
-  agent session
+- git, ssh, Python 3.12 (for graphify), basics
+- No agent runtime — runtime is added in the next layer
 
-This is the Konveyor product layer. Everything here is maintained by
-the project.
-
-**Layer 2 — Language images** (e.g., `quay.io/konveyor/agent-java`):
+**Layer 1.5 — Runtime images** (e.g., `agent-base-goose`,
+`agent-base-opencode`):
 
 - Extends base
-- Includes all supported SDK versions for the language ecosystem
-  (e.g., JDK 8, 11, 17, 21 + Maven + Gradle in a single image)
-- The agent selects the appropriate version at runtime based on the
-  target application's build configuration
+- Adds one agent runtime binary
+- One image per runtime — different release cadences, no bloat
 
-Multiple SDK versions in a single image avoids a matrix of
-per-version images. Image size is acceptable for agent workloads —
-these are long-running Sandbox pods, often pre-pulled via
-SandboxWarmPool, not ephemeral microservice containers.
+**Layer 2 — Language images** (e.g., `agent-java-goose`):
+
+- Extends a runtime image
+- Adds language toolchains (e.g., JDK 21 + Maven)
+- The agent uses the available tools to build and test code
 
 **Layer 3 — Custom images** (built by users):
 
 - Extends a language image
-- Adds corporate-specific dependencies: proprietary JDBC drivers,
-  internal CA certificates, custom build plugins, licensed libraries
-- Built by user CI pipelines, pushed to internal registries
+- Adds corporate-specific dependencies
 
 ```dockerfile
-FROM quay.io/konveyor/agent-java:latest
-COPY oracle-jdbc-driver.jar /opt/libs/
+FROM quay.io/konveyor/agent-java-goose:latest
 COPY internal-ca-bundle.pem /etc/pki/ca-trust/source/anchors/
 RUN update-ca-trust
 ```
 
-#### Self-describing images via labels
+See the agent-base-image-composition enhancement for full details.
 
-Following the APB pattern where `apb.yml` was base64-encoded into a
-Docker label (`com.redhat.apb.spec`), agent images carry a
-machine-readable declaration of their capabilities:
+#### Self-describing images via labels (deferred)
 
-```dockerfile
-LABEL "io.konveyor.agent.spec"="<base64-encoded YAML>"
-```
-
-Decoded, the label contains:
-
-```yaml
-runtime: goose
-runtimeVersion: "1.23"
-provides:
-  - java-8
-  - java-11
-  - java-17
-  - java-21
-  - mvn
-  - gradle
-  - git
-  - fetch-analysis
-  - run-analysis
-```
-
-The controller can read this label from the registry (inspecting the
-image manifest without pulling the image) to surface available
-capabilities in the UI and optionally validate compatibility with
-referenced skills.
+A future enhancement may add machine-readable capability labels to
+agent images (following the APB pattern of base64-encoded YAML in a
+Docker label). This would surface available capabilities in the UI
+without pulling the image. Deferred because the harness auto-detects
+the runtime, and skill-to-image compatibility is enforced by
+convention, not validation.
 
 #### Air-gap and network-restricted support
 
@@ -317,6 +359,19 @@ would need explicit `-Xmx` flags if tests exercise memory-sensitive
 code paths.
 
 ## Alternatives Considered
+
+### Hub adapter in the controller
+
+We considered having the controller resolve application metadata from
+Hub (git URLs, credentials) via an internal adapter. The AgentRun
+would carry an application ID, and the controller would call Hub's
+API to resolve it.
+
+Rejected because: it couples the controller to Hub's API and makes
+the CRDs domain-specific. The Tekton model is better — the AgentRun
+carries resolved values (params), and the controller passes them
+through without interpretation. The UI or CLI resolves from Hub,
+Backstage, or wherever before creating the AgentRun.
 
 ### Hub API resources instead of CRDs
 
@@ -358,26 +413,41 @@ directly. Agent Sandbox provides lifecycle management (hibernation,
 warm pools, stable identity, network isolation) that we would
 otherwise need to build ourselves.
 
-### Tekton as the execution layer
+### Tekton as the orchestration layer
 
-Tekton Tasks/Pipelines were considered for orchestrating multi-phase
-agent plans. Agent Sandbox is a better fit because agent workloads are
-long-running, stateful, and benefit from warm pools — characteristics
-that align with Sandbox semantics rather than batch job semantics.
-Tekton remains an option for users who prefer pipeline-based
-orchestration.
+Tekton Tasks/Pipelines were considered for orchestrating multi-stage
+agent playbooks. Deferred, not rejected: the MVP requires only
+sequential stage execution, and a custom controller is simpler than
+adding a Tekton dependency. The architecture does not preclude Tekton
+integration later — AgentPlaybookRun could generate Tekton
+PipelineRuns as an implementation detail when users need conditionals,
+parallelism, retries, or supply chain signing.
 
-### Flat phase list without stages
+### Stages with phases and session continuity
 
-We considered a flat list of phases where session continuity is
-implicit (consecutive phases with compatible runtimes share a
-session) and context breaks happen automatically when the runtime
-changes. Explicit stages make session continuity boundaries visible
-in the plan definition, give architects direct control over where
-fresh context starts, and define the handoff points where progress
-documents are written. Stages also allow intentional context breaks
-with the same agent — useful when context windows fill up during
-long migration sessions.
+We originally designed AgentPlaybook with stages containing multiple
+phases, where phases within a stage shared session state via a PVC
+(SQLite database). This provided full conversation continuity within
+a stage.
+
+Rejected for MVP because: session PVC management adds significant
+complexity (PVC lifecycle, runtime homogeneity constraints, SQLite
+concurrent access concerns). The flat-stage model with git-based
+handoff is dramatically simpler and sufficient for the discover →
+implement → review workflow. Phase-within-stage session continuity
+is deferred as a future enhancement.
+
+### PVC-based workspace persistence
+
+We considered using PVCs for workspace persistence across runs
+instead of git-as-persistence. Each application would have a
+workspace PVC that survives between AgentRuns.
+
+Rejected because: PVC lifecycle management per application adds
+operational complexity. Git-as-persistence eliminates this — the
+workspace is ephemeral, the branch is the durable state. This model
+is validated by fullsend (Red Hat/Konflux) and aligns with how
+cloud agent products (Cursor, Codex) handle workspaces.
 
 ### Skill-declared tool dependencies
 
@@ -439,50 +509,30 @@ during the same session.
 ## Consequences
 
 - **Dependency on Agent Sandbox:** The project depends on a SIG Apps
-  project that is still maturing. If Agent Sandbox changes
-  significantly we will need to adapt. Mitigation: Agent Sandbox is
-  built on standard pod primitives; fallback to bare pods is
-  straightforward.
-- **Dependency on skillimage:** skillimage is v0.1.0 with a single
-  contributor. We mitigate by contributing directly and shaping the
-  project's direction. Red Hat OCTO backing reduces risk.
-- **ImageVolume requirement:** K8s 1.33+ or OpenShift 4.20+ required
-  for ImageVolume support. Older clusters would need an init container
-  fallback that pulls OCI artifacts at startup.
-- **Hub remains required for migration use case:** While the CRDs are
-  domain-agnostic, the migration skill needs analysis data from Hub.
-  Hub is a runtime data dependency, not an infrastructure dependency.
-- **K8s API proxy in UI:** The UI server needs a new proxy route to
-  the K8s API. Local development requires either a remote cluster
-  (via kubeconfig) or mock data.
-- **No Hub backend changes needed:** The CRDs eliminate the need for
-  Hub API endpoints, database tables, and Go models for these
-  resources. This significantly reduces the implementation scope.
-- **Orchestrator required:** The AgentPlan execution model (creating
-  Sandboxes per phase, passing session IDs, managing PVCs, capturing
-  handoff state) requires a controller or orchestrator. Agent Sandbox
-  provides the execution primitive but not the sequencing logic.
-- **Single runtime assumption:** The initial implementation assumes
-  goose as the agent runtime. The session resumption mechanism is
-  runtime-specific (goose's SQLite session DB). Supporting additional
-  runtimes (opencode, Claude Code) would require abstracting session
-  persistence and ensuring runtime homogeneity within stages.
-- **Image maintenance burden:** The project must maintain and publish
-  base and language-specific agent images. Each language image
-  bundles multiple SDK versions, increasing image size (the Java
-  image with JDK 8/11/17/21 + Maven + Gradle adds ~1.2 GB to the
-  base). This is acceptable for long-running Sandbox pods with warm
-  pool pre-pulling but would not be appropriate for ephemeral
-  containers.
-- **Users own corporate extensions:** Organizations with proprietary
-  dependencies (licensed libraries, internal CAs, custom tools) must
-  build and maintain their own agent images extending the published
-  language images. Good documentation and simple base images reduce
-  this burden, following the APB pattern.
+  project that is still maturing. Mitigation: Agent Sandbox is built
+  on standard pod primitives; fallback to bare pods is feasible.
+  OpenShell (NVIDIA) can layer on top for security hardening.
+- **Dependency on skillimage:** skillimage is v0.7.2. We mitigate by
+  contributing directly. Red Hat OCTO backing reduces risk. Konveyor
+  is a significant consumer driving stability.
+- **ImageVolume requirement:** K8s 1.33+ or OpenShift 4.20+ required.
+  Older clusters would need an init container fallback.
+- **Git remote availability:** Git-as-persistence means work in
+  progress is lost on pod crash if the harness hasn't pushed yet.
+  Mitigation: incremental push during execution, not just on exit.
+- **Write credentials required:** Pushing to the assets/source repo
+  requires write-capable git credentials. The same credential model
+  used by tackle2-addon-platform (identity with `role: "asset"` or
+  `role: "source"`).
+- **Controller has no inventory dependency:** The CRDs are domain-
+  agnostic. The controller does not call Hub, Backstage, or any
+  inventory system. The creator of the AgentRun (UI, CLI, plugin)
+  resolves application metadata and supplies it as params.
+- **No Hub backend changes needed:** CRDs eliminate the need for Hub
+  API endpoints, database tables, and Go models for agent resources.
+- **Image maintenance burden:** The project must maintain base,
+  runtime, and language-specific images. See the agent-base-image-
+  composition enhancement for details.
 - **No skill-to-image compatibility validation (by design):** Skills
-  do not declare tool dependencies. An architect who attaches a
-  Maven skill to a Python agent image will discover the mismatch at
-  runtime, not at composition time. The self-describing image label
-  mitigates this by surfacing image capabilities in the UI, but
-  automated validation is not enforced. Convention and curated images
+  do not declare tool dependencies. Convention and curated images
   are the primary guardrails.
